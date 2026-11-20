@@ -1,0 +1,673 @@
+# Compte rendu — TP 3 : Création d'une application multi-services avec Docker Compose
+
+* **Formation :** Licence 3 SI — RIST & BDGL
+* **Module :** Introduction au Cloud Computing (Séance 4)
+* **Nom :** GRAH GRACE DIVINE SEPHORA
+* **Professeur :** DR BAKAYOKO
+* **Environnement :** VM `Ubuntu-srv` (VirtualBox, 3 Go RAM) + Docker / Docker Compose
+
+---
+
+## Partie 0 : Préparer la VM
+
+Ici, on augmente la mémoire RAM de la VM initiale à 3 Go, on ajoute la redirection de port pour la console MinIO, on arrête les conteneurs du TP 2 de Docker et on récupère les images nécessaires (`postgres:17` et `cgr.dev/chainguard/minio:latest`).
+
+### 1. Commandes exécutées
+
+**Sur l'hôte Windows (PowerShell) :**
+```powershell
+$env:Path += ";C:\Program Files\Oracle\VirtualBox"
+VBoxManage controlvm Ubuntu-srv acpipowerbutton
+VBoxManage modifyvm Ubuntu-srv --memory 3072
+VBoxManage modifyvm Ubuntu-srv --natpf1 "minio,tcp,127.0.0.1,9001,,9001"
+VBoxManage modifyvm Ubuntu-srv --natpf1 "api,tcp,127.0.0.1,5000,,5000"
+VBoxManage startvm Ubuntu-srv --type headless
+ssh etudiant@127.0.0.1 -p 2222
+```
+
+**Sur la VM `Ubuntu-srv` :**
+```bash
+docker rm -f $(docker ps -aq) 2>/dev/null
+mkdir -p ~/tp3 && cp -r ~/api ~/tp3/api && cd ~/tp3
+docker pull postgres:17
+docker pull cgr.dev/chainguard/minio:latest
+```
+
+### 2. Sorties observées
+```text
+PS C:\WINDOWS\system32> VBoxManage startvm Ubuntu-srv --type headless
+Waiting for VM "Ubuntu-srv" to power on...
+VM "Ubuntu-srv" has been successfully started.
+
+etudiant@ubuntu-ser:~$ docker rm -f $(docker ps -aq) 2>/dev/null
+3f189de55401
+40f76eae1d35
+6ad44f2d85f7
+0d9da8be5ac9
+c69ac22df22c
+423a75f46940
+b3aa31188ac7
+eb8056107ab5
+
+etudiant@ubuntu-ser:~/tp3$ docker pull postgres:17
+17: Pulling from library/postgres
+Digest: sha256:b60e90042aa6b8dbecd58e224b3e36114dbf8ad754465264c2476ad58a86e45c
+Status: Downloaded newer image for postgres:17
+docker.io/library/postgres:17
+```
+
+---
+
+## Partie 1 : Décrire et lancer l'application (25 min)
+
+### 1. Création de `docker-compose.yml` et démarrage des services
+
+**Commandes exécutées :**
+```bash
+cat > docker-compose.yml <<'EOF'
+services:
+  api:
+    build: ./api
+    ports: ["5000:5000"]
+    environment:
+      NOM: "GRAH GRACE DIVINE SEPHORA"
+      DATABASE_URL: postgresql://app:app_mdp@db:5432/app
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: tp3admin
+      S3_SECRET_KEY: tp3-secret-123
+      S3_BUCKET: fichiers
+    depends_on:
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_started
+
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app_mdp
+      POSTGRES_DB: app
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: cgr.dev/chainguard/minio:latest
+    user: "0:0"
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: tp3admin
+      MINIO_ROOT_PASSWORD: tp3-secret-123
+    ports: ["9001:9001"]
+    volumes:
+      - minio-data:/data
+
+volumes:
+  db-data:
+  minio-data:
+EOF
+
+docker compose config -q
+docker compose up -d --build
+docker compose ps
+docker compose logs --tail 5 minio
+curl -s http://localhost:5000
+```
+
+**Sorties observées :**
+```text
+[+] Running 7/7
+ ✔ tp3-api                Built                                                0.0s
+ ✔ Network tp3_default    Created                                              0.2s
+ ✔ Volume tp3_db-data     Created                                              0.0s
+ ✔ Volume tp3_minio-data  Created                                              0.0s
+ ✔ Container tp3-db-1     Healthy                                              7.7s
+ ✔ Container tp3-minio-1  Started                                              2.2s
+ ✔ Container tp3-api-1    Started                                              8.1s
+
+etudiant@ubuntu-ser:~/tp3$ docker compose ps
+NAME          IMAGE                             COMMAND                  SERVICE   CREATED              STATUS                        PORTS
+tp3-api-1     tp3-api                           "/bin/sh -c 'python …"   api       About a minute ago   Up About a minute             0.0.0.0:5000->5000/tcp, [::]:5000->5000/tcp
+tp3-db-1      postgres:17                       "docker-entrypoint.s…"   db        About a minute ago   Up About a minute (healthy)   5432/tcp
+tp3-minio-1   cgr.dev/chainguard/minio:latest   "/usr/bin/minio serv…"   minio     About a minute ago   Up About a minute             0.0.0.0:9001->9001/tcp, [::]:9001->9001/tcp
+
+etudiant@ubuntu-ser:~/tp3$ docker compose logs --tail 5 minio
+minio-1  |
+minio-1  | API: http://172.18.0.2:9000  http://127.0.0.1:9000
+minio-1  | WebUI: http://172.18.0.2:9001 http://127.0.0.1:9001
+minio-1  |
+minio-1  | Docs: https://min.io
+
+etudiant@ubuntu-ser:~/tp3$ curl -s http://localhost:5000
+{"conteneur":"818ca3de5a6d","message":"API fil rouge","trinome":"inconnu"}
+```
+
+### 2. Exploration du réseau et test de la base de données
+
+**Commandes exécutées :**
+```bash
+docker network ls | grep tp3
+docker network inspect tp3_default --format '{{range .Containers}}{{.Name}} {{.IPv4Address}}{{"\n"}}{{end}}'
+docker compose exec api python -c "import socket; print(socket.gethostbyname('db'), socket.gethostbyname('minio'))"
+nc -zv localhost 5432
+docker compose exec db psql -U app -d app -c "SELECT version();"
+```
+
+**Sorties observées :**
+```text
+etudiant@ubuntu-ser:~/tp3$ docker network ls | grep tp3
+afc4cfe9e793   tp3_default   bridge    local
+
+etudiant@ubuntu-ser:~/tp3$ docker network inspect tp3_default --format '{{range .Containers}}{{.Name}} {{.IPv4Address}}{{"\n"}}{{end}}'
+tp3-api-1 172.18.0.4/16
+tp3-minio-1 172.18.0.2/16
+tp3-db-1 172.18.0.3/16
+
+etudiant@ubuntu-ser:~/tp3$ docker compose exec api python -c "import socket; print(socket.gethostbyname('db'), socket.gethostbyname('minio'))"
+172.18.0.3 172.18.0.2
+
+etudiant@ubuntu-ser:~/tp3$ nc -zv localhost 5432
+nc: connect to localhost (127.0.0.1) port 5432 (tcp) failed: Connection refused
+
+etudiant@ubuntu-ser:~/tp3$ docker compose exec db psql -U app -d app -c "SELECT version();"
+ PostgreSQL 17.12 (Debian 17.12-1.pgdg13+1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+(1 row)
+```
+
+### 3. Questions et Réponses
+
+**Q1. Quels sont les noms des trois conteneurs créés ? D'où vient le préfixe `tp3` ?**
+
+> **Réponse :**
+> * Les trois conteneurs créés sont : **`tp3-api-1`**, **`tp3-db-1`** et **`tp3-minio-1`**.
+> * Le préfixe **`tp3`** provient automatiquement du **nom du répertoire parent** (`~/tp3`) dans lequel est exécuté le fichier `docker-compose.yml`.
+
+
+**Q2. Quelles adresses IP ont les trois services sur le réseau `tp3_default` ? À quelle adresse le nom `db` se résout-il depuis l'API ?**
+
+> **Réponse :**
+> * Sur le réseau privé `tp3_default`, Docker a attribué les adresses suivantes :
+>   * `tp3-minio-1` : **`172.18.0.2/16`**
+>   * `tp3-db-1` : **`172.18.0.3/16`**
+>   * `tp3-api-1` : **`172.18.0.4/16`**
+> * Depuis le conteneur `api`, le nom de service `db` se résout vers **`172.18.0.3`** grâce au serveur DNS interne intégré à Docker Compose.
+
+
+**Q3. Le port 5432 est-il joignable depuis la VM (`nc`) ? Pourquoi ? Est-ce un bon choix de sécurité ? Faites le lien avec les sous-réseaux privés du cloud.**
+
+> **Réponse :**
+> * **Non**, la commande `nc -zv localhost 5432` échoue (`Connection refused`). Donc, le port 5432 **n'est pas** joignable depuis la VM.
+> * **Pourquoi :** Aucune directive `ports` n'a été configurée pour le service `db` dans `docker-compose.yml` ; le port 5432 n'est donc pas publié sur l'hôte et reste uniquement exposé à l'intérieur du réseau Docker `tp3_default`.
+> * **Sécurité et lien avec le cloud :** C'est une excellente pratique de sécurité. Dans le cloud (AWS VPC, Azure VNet), cela correspond à l'architecture **sous-réseau public / sous-réseau privé** : seule l'API est placée en frontal exposé, tandis que la base de données est isolée dans un sous-réseau privé injoignable directement depuis Internet.
+
+**Q4. À quoi servent le `healthcheck` de `db` et la condition `service_healthy` dans `depends_on` ? Que pourrait-il se passer sans eux ?**
+
+> **Réponse :**
+> * Le **`healthcheck`** (`pg_isready -U app -d app`) teste périodiquement si PostgreSQL est réellement prêt à accepter des connexions SQL (et pas seulement si le processus du conteneur est lancé).
+> * La condition **`service_healthy`** oblige Docker Compose à attendre que le test de santé de `db` soit validé avant de démarrer le conteneur `api`.
+> * **Sans eux :** `api` et `db` démarreraient simultanément ; l'API tenterait alors de se connecter à la base pendant que PostgreSQL initialise encore ses fichiers système, provoquant des échecs de connexion au démarrage.
+
+---
+
+## Partie 2 : Vérifier la persistance (15 min)
+
+### 1. Création de la table de test et vérification de persistance après `docker compose down`
+
+**Commandes exécutées :**
+```bash
+docker compose exec db psql -U app -d app -c "CREATE TABLE test (msg TEXT); INSERT INTO test VALUES ('bonjour TP3');"
+docker compose exec db psql -U app -d app -c "SELECT * FROM test;"
+docker compose down
+docker compose ps -a
+docker volume ls | grep tp3
+docker compose up -d
+docker compose exec db psql -U app -d app -c "SELECT * FROM test;"
+```
+
+**Sorties observées :**
+```text
+etudiant@ubuntu-ser:~/tp3$ docker compose exec db psql -U app -d app -c "CREATE TABLE test (msg TEXT); INSERT INTO test VALUES ('bonjour TP3');"
+CREATE TABLE
+INSERT 0 1
+
+etudiant@ubuntu-ser:~/tp3$ docker compose exec db psql -U app -d app -c "SELECT * FROM test;"
+     msg
+-------------
+ bonjour TP3
+(1 row)
+
+etudiant@ubuntu-ser:~/tp3$ docker compose down
+[+] Running 4/4
+ ✔ Container tp3-api-1    Removed                                             90.1s
+ ✔ Container tp3-db-1     Removed                                              1.0s
+ ✔ Container tp3-minio-1  Removed                                              0.9s
+ ✔ Network tp3_default    Removed                                              0.2s
+
+etudiant@ubuntu-ser:~/tp3$ docker compose ps -a
+NAME      IMAGE     COMMAND   SERVICE   CREATED   STATUS    PORTS
+
+etudiant@ubuntu-ser:~/tp3$ docker volume ls | grep tp3
+local     tp3_db-data
+local     tp3_minio-data
+
+etudiant@ubuntu-ser:~/tp3$ docker compose up -d
+[+] Running 4/4
+ ✔ Network tp3_default    Created                                              0.2s
+ ✔ Container tp3-minio-1  Started                                              1.7s
+ ✔ Container tp3-db-1     Healthy                                              7.2s
+ ✔ Container tp3-api-1    Started                                              7.4s
+
+etudiant@ubuntu-ser:~/tp3$ docker compose exec db psql -U app -d app -c "SELECT * FROM test;"
+     msg
+-------------
+ bonjour TP3
+(1 row)
+```
+
+---
+
+### 2. Inspection du volume sur l'hôte et test de suppression avec `docker compose down -v`
+
+**Commandes exécutées :**
+```bash
+docker volume inspect tp3_db-data --format '{{.Mountpoint}}'
+sudo du -sh $(docker volume inspect tp3_db-data --format '{{.Mountpoint}}')
+docker system df -v | grep tp3
+docker compose down -v
+docker compose up -d
+docker compose exec db psql -U app -d app -c "SELECT * FROM test;"
+```
+
+**Sorties observées :**
+```text
+etudiant@ubuntu-ser:~/tp3\$ docker volume inspect tp3_db-data --format '{{.Mountpoint}}'
+/var/lib/docker/volumes/tp3_db-data/_data
+
+etudiant@ubuntu-ser:~/tp3 sudo du -sh (docker volume inspect tp3_db-data --format '{{.Mountpoint}}')
+47M     /var/lib/docker/volumes/tp3_db-data/_data
+
+etudiant@ubuntu-ser:~/tp3\$ docker system df -v | grep tp3
+tp3-api                    latest    a6e790ea439d   2 hours ago    198MB     87.71MB       110MB         1
+8069ede73d50   tp3-api                           "/bin/sh -c 'python …"   0               229kB     13 minutes ago   Up 13 minutes             tp3-api-1
+bfce326e949b   postgres:17                       "docker-entrypoint.s…"   1               20.5kB    13 minutes ago   Up 13 minutes (healthy)   tp3-db-1
+a353d81f2290   cgr.dev/chainguard/minio:latest   "/usr/bin/minio serv…"   1               20.5kB    13 minutes ago   Up 13 minutes             tp3-minio-1
+tp3_db-data      1         48.42MB
+tp3_minio-data   1         17.09kB
+
+etudiant@ubuntu-ser:~/tp3\$ docker compose down -v
+[+] Running 6/6
+ ✔ Container tp3-api-1    Removed                                            295.7s
+ ✔ Container tp3-minio-1  Removed                                              0.9s
+ ✔ Container tp3-db-1     Removed                                              1.0s
+ ✔ Network tp3_default    Removed                                              0.3s
+ ✔ Volume tp3_minio-data  Removed                                              0.1s
+ ✔ Volume tp3_db-data     Removed                                              0.1s
+
+etudiant@ubuntu-ser:~/tp3\$ docker compose up -d
+[+] Running 6/6
+ ✔ Network tp3_default    Created                                              0.2s
+ ✔ Volume tp3_db-data     Created                                              0.0s
+ ✔ Volume tp3_minio-data  Created                                              0.0s
+ ✔ Container tp3-minio-1  Started                                              1.9s
+ ✔ Container tp3-db-1     Healthy                                              6.9s
+ ✔ Container tp3-api-1    Started                                              7.0s
+
+etudiant@ubuntu-ser:~/tp3\$ docker compose exec db psql -U app -d app -c "SELECT * FROM test;"
+ERROR:  relation "test" does not exist
+LINE 1: SELECT * FROM test;
+                      ^
+```
+
+---
+
+### 3. Questions et Réponses
+
+**Q1. Remplissez un tableau : pour `down` puis `down -v`, qu'est-il arrivé aux conteneurs, au réseau, aux volumes et à la ligne `bonjour TP3` ?**
+
+> **Réponse :**
+>
+> | Commande | Conteneurs (`api`, `db`, `minio`) | Réseau (`tp3_default`) | Volumes (`tp3_db-data`, `tp3_minio-data`) | Ligne `bonjour TP3` |
+> | :--- | :--- | :--- | :--- | :--- |
+> | **`docker compose down`** | **Supprimés** (`docker compose ps -a` est vide) | **Supprimé** | **Conservés** (toujours listés par `docker volume ls`) | **Conservée** (relue intacte après `docker compose up -d`) |
+> | **`docker compose down -v`** | **Supprimés** | **Supprimé** | **Supprimés** (recréés vierges au `up -d` suivant) | **Perdue** (`ERROR: relation "test" does not exist`) |
+
+
+**Q2. Où se trouvent physiquement les données de PostgreSQL ? Quel est l'équivalent cloud d'un volume attaché à un serveur (cours, stockage bloc) ?**
+
+> **Réponse :**
+> * **Emplacement physique :** Sur la VM Ubuntu, Docker stocke les données en dehors des conteneurs dans le répertoire géré par son moteur : **`/var/lib/docker/volumes/tp3_db-data/_data`** (occupant **47 Mio**, soit **48,42 Mo** sur le disque).
+> * **Équivalent cloud :** Un volume attaché à un serveur correspond au **stockage bloc managé** (un disque brut vu et formaté par un seul serveur), tel que **Amazon EBS** (*Elastic Block Store*) sur AWS ou **Azure Managed Disks** sur Microsoft Azure. Comme un volume Docker, son cycle de vie est indépendant de celui de la machine virtuelle de calcul.
+
+
+**Q3. Pourquoi ne faut-il jamais lancer `down -v` sur un serveur de production sans sauvegarde ?**
+
+> **Réponse :**
+> L'option `-v` ordonne à Docker de détruire définitivement tous les volumes nommés associés à l'application en même temps que les conteneurs. Sur un serveur de production, exécuter `docker compose down -v` sans sauvegarde préalable entraînerait l'**effacement irréversible de toutes les données persistantes** (bases de données, fichiers téléversés par les utilisateurs, etc.).
+
+---
+
+## Partie 3 : Brancher l'API sur la base et le stockage (25 min)
+
+### 1. Mise à jour du code de l'API v2.0 et reconstruction
+
+**Commandes exécutées :**
+```bash
+cat > api/requirements.txt <<'EOF'
+flask>=3,<4
+psycopg[binary]>=3.2,<4
+boto3>=1.34,<2
+EOF
+
+cat > api/app.py <<'EOF'
+import os
+import time
+import uuid
+
+import boto3
+import psycopg
+from botocore.exceptions import ClientError
+from flask import Flask, Response, jsonify, request
+
+DATABASE_URL = os.environ["DATABASE_URL"]
+BUCKET = os.environ.get("S3_BUCKET", "fichiers")
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url=os.environ["S3_ENDPOINT"],
+    aws_access_key_id=os.environ["S3_ACCESS_KEY"],
+    aws_secret_access_key=os.environ["S3_SECRET_KEY"],
+    region_name="us-east-1",
+)
+app = Flask(__name__)
+
+
+def connexion():
+    return psycopg.connect(DATABASE_URL, autocommit=True)
+
+
+def initialiser():
+    """Crée la table et le bucket, en attendant que la base et le stockage répondent."""
+    for _ in range(30):
+        try:
+            with connexion() as c:
+                c.execute(
+                    """CREATE TABLE IF NOT EXISTS fichiers (
+                           id SERIAL PRIMARY KEY,
+                           nom TEXT NOT NULL,
+                           cle TEXT NOT NULL,
+                           taille INTEGER NOT NULL,
+                           depose_le TIMESTAMP DEFAULT now())"""
+                )
+            try:
+                s3.head_bucket(Bucket=BUCKET)
+            except ClientError:
+                s3.create_bucket(Bucket=BUCKET)
+            print("Base et stockage prêts", flush=True)
+            return
+        except Exception as erreur:
+            print(f"En attente des services : {erreur}", flush=True)
+            time.sleep(2)
+    raise RuntimeError("Base ou stockage injoignable")
+
+
+@app.get("/")
+def accueil():
+    return jsonify(message="API fil rouge", version="2.0",
+                   binome=os.environ.get("BINOME", "inconnu"))
+
+
+@app.get("/sante")
+def sante():
+    with connexion() as c:
+        c.execute("SELECT 1")
+    s3.head_bucket(Bucket=BUCKET)
+    return jsonify(base="ok", stockage="ok")
+
+
+@app.post("/fichiers")
+def deposer():
+    fichier = request.files.get("fichier")
+    if fichier is None or fichier.filename == "":
+        return jsonify(erreur="champ 'fichier' manquant"), 400
+    donnees = fichier.read()
+    cle = f"{uuid.uuid4().hex}-{fichier.filename}"
+    s3.put_object(Bucket=BUCKET, Key=cle, Body=donnees,
+                  ContentType=fichier.mimetype or "application/octet-stream")
+    with connexion() as c:
+        ligne = c.execute(
+            "INSERT INTO fichiers (nom, cle, taille) VALUES (%s, %s, %s) RETURNING id",
+            (fichier.filename, cle, len(donnees)),
+        ).fetchone()
+    return jsonify(id=ligne[0], nom=fichier.filename, cle=cle, taille=len(donnees)), 201
+
+
+@app.get("/fichiers")
+def lister():
+    with connexion() as c:
+        lignes = c.execute(
+            "SELECT id, nom, cle, taille, depose_le FROM fichiers ORDER BY id"
+        ).fetchall()
+    return jsonify([
+        {"id": l[0], "nom": l[1], "cle": l[2], "taille": l[3],
+         "depose_le": l[4].isoformat()}
+        for l in lignes
+    ])
+
+
+@app.get("/fichiers/<int:ident>")
+def telecharger(ident):
+    with connexion() as c:
+        ligne = c.execute("SELECT cle FROM fichiers WHERE id = %s", (ident,)).fetchone()
+    if ligne is None:
+        return jsonify(erreur="fichier introuvable"), 404
+    objet = s3.get_object(Bucket=BUCKET, Key=ligne[0])
+    return Response(objet["Body"].read(), mimetype=objet["ContentType"])
+
+
+initialiser()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
+EOF
+
+docker compose up -d --build api
+docker compose logs api | head -n 5
+curl -s http://localhost:5000
+curl -s http://localhost:5000/sante
+```
+
+**Sorties observées :**
+```text
+[+] Running 4/4
+ ✔ tp3-api                Built                                                0.0s
+ ✔ Container tp3-minio-1  Running                                              0.0s
+ ✔ Container tp3-db-1     Healthy                                             49.4s
+ ✔ Container tp3-api-1    Started                                             50.2s
+
+etudiant@ubuntu-ser:~/tp3$ docker compose logs api | head -n 5
+api-1  | Base et stockage prêts
+api-1  |  * Serving Flask app 'app'
+api-1  |  * Debug mode: off
+api-1  | WARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.
+api-1  |  * Running on all addresses (0.0.0.0)
+
+etudiant@ubuntu-ser:~/tp3$ curl -s http://localhost:5000
+{"binome":"NOM1-NOM2","message":"API fil rouge","version":"2.0"}
+
+etudiant@ubuntu-ser:~/tp3$ curl -s http://localhost:5000/sante
+{"base":"ok","stockage":"ok"}
+```
+
+---
+
+### 2. Tests de dépôt, listage, téléchargement et vérification PostgreSQL / MinIO
+
+**Commandes exécutées :**
+```bash
+# Sur la VM ubuntu-srv
+echo "Relevé de notes fictif" > releve.txt
+curl -s -F "fichier=@releve.txt" http://localhost:5000/fichiers
+curl -s -F "fichier=@/etc/hostname" http://localhost:5000/fichiers
+curl -s http://localhost:5000/fichiers
+curl -s http://localhost:5000/fichiers/1
+curl -s -F "autre=@releve.txt" http://localhost:5000/fichiers
+docker compose exec db psql -U app -d app -c "SELECT id, nom, cle, taille FROM fichiers;"
+```
+
+```powershell
+# Sur l'hôte Windows (PowerShell)
+curl.exe -F "fichier=@C:\Users\HP\Pictures\iCloud Photos\Photos\IMG_1397.PNG" http://127.0.0.1:5000/fichiers
+```
+
+**Sorties observées :**
+```text
+etudiant@ubuntu-ser:~/tp3$ curl -s -F "fichier=@releve.txt" http://localhost:5000/fichiers
+{"cle":"5cd5c05097b6413a8a79a7fed91dc99c-releve.txt","id":1,"nom":"releve.txt","taille":24}
+
+etudiant@ubuntu-ser:~/tp3$ curl -s -F "fichier=@/etc/hostname" http://localhost:5000/fichiers
+{"cle":"66f1be88bac5466a8f63c45f0cef8135-hostname","id":2,"nom":"hostname","taille":11}
+
+etudiant@ubuntu-ser:~/tp3$ curl -s http://localhost:5000/fichiers
+[{"cle":"5cd5c05097b6413a8a79a7fed91dc99c-releve.txt","depose_le":"2026-11-20T18:10:33.420635","id":1,"nom":"releve.txt","taille":24},{"cle":"66f1be88bac5466a8f63c45f0cef8135-hostname","depose_le":"2026-11-20T18:10:55.037229","id":2,"nom":"hostname","taille":11}]
+
+etudiant@ubuntu-ser:~/tp3$ curl -s http://localhost:5000/fichiers/1
+Relevé de notes fictif
+
+etudiant@ubuntu-ser:~/tp3$ curl -s -F "autre=@releve.txt" http://localhost:5000/fichiers
+{"erreur":"champ 'fichier' manquant"}
+
+etudiant@ubuntu-ser:~/tp3$ docker compose exec db psql -U app -d app -c "SELECT id, nom, cle, taille FROM fichiers;"
+ id |    nom     |                     cle                     | taille
+----+------------+---------------------------------------------+--------
+  1 | releve.txt | 5cd5c05097b6413a8a79a7fed91dc99c-releve.txt |     24
+  2 | hostname   | 66f1be88bac5466a8f63c45f0cef8135-hostname   |     11
+(2 rows)
+
+PS C:\WINDOWS\system32> curl.exe -F "fichier=@C:\Users\HP\Pictures\iCloud Photos\Photos\IMG_1397.PNG" http://127.0.0
+{"cle":"47ebad73a80e41f69da578a801349da4-IMG_1397.PNG","id":3,"nom":"IMG_1397.PNG","taille":1831295}
+```
+
+---
+
+### 3. Questions et Réponses
+
+**Q1. Pourquoi l'API ajoute-t-elle un identifiant aléatoire (`uuid4`) devant le nom du fichier pour construire la clé ? Que se passerait-il si deux étudiants déposaient chacun un fichier `photo.jpg` ?**
+
+> **Réponse :**
+> * Préfixer le nom original avec un identifiant aléatoire (`uuid.uuid4().hex`) garantit que chaque dépôt génère une clé strictement unique (par exemple `47ebad73a80e41f69da578a801349da4-IMG_1397.PNG`). L'identifiant aléatoire (`uuid4`) garantit ainsi que chaque objet est identifié de manière unique par sa clé dans le bucket.
+> * **Sans `uuid4` :** Si deux étudiants déposaient chacun un fichier nommé `photo.jpg`, ils auraient exactement la même clé (`photo.jpg`). Dans le protocole S3, écrire un objet sur une clé existante **écrase silencieusement** l'objet précédent : la photo du deuxième étudiant remplacerait définitivement celle du premier dans MinIO, et les deux entrées en base pointeraient vers le même fichier.
+
+
+**Q2. Que trouve-t-on dans PostgreSQL et que trouve-t-on dans MinIO pour un même fichier ? Pourquoi ne pas stocker directement le fichier dans la base ?**
+
+> **Réponse :**
+> * **Dans PostgreSQL :** On trouve uniquement les **métadonnées structurées** du fichier enregistrées dans la table `fichiers` : son identifiant numérique (`id`), son nom d'origine (`nom`), sa clé unique dans le bucket (`cle`), sa taille en octets (`taille`) et sa date d'envoi (`depose_le`).
+> * **Dans MinIO :** On trouve l'**objet binaire brut** (le contenu réel du fichier, ex. les 1 831 295 octets de l'image `IMG_1397.PNG`), accompagné de son type MIME (`ContentType`).
+> * **Pourquoi ne pas le stocker en base :** Selon le cours (*« la base garde le chemin du fichier, le stockage objet garde le fichier »*), stocker des fichiers lourds dans une base relationnelle alourdit considérablement les sauvegardes, ralentit les requêtes et l'indexation, et consomme inutilement la RAM et le stockage bloc (coûteux), alors que le stockage objet est conçu pour absorber des volumes quasi illimités à moindre coût.
+
+
+**Q3. Dans le code, quelles lignes faudrait-il changer pour utiliser Amazon S3 au lieu de MinIO ? Et dans le fichier Compose ?**
+
+> **Réponse :**
+> * **Dans le code (`api/app.py`) :** L'API S3 étant un standard, la logique applicative ne change pas. Lors de la création du client `boto3.client("s3", ...)`, il suffit simplement de **supprimer le paramètre `endpoint_url=os.environ["S3_ENDPOINT"]`** (car par défaut, `boto3` s'adresse directement aux serveurs d'Amazon S3) et de remplacer `region_name="us-east-1"` par la région AWS choisie (ex. `eu-west-3`).
+> * **Dans `docker-compose.yml`, il faut :**
+>   * Supprimer tout le bloc du service **`minio`**, la déclaration du volume **`minio-data:`** en bas du fichier, et retirer **`minio`** de la section **`depends_on`** du service `api`.
+>   * Supprimer la variable d'environnement **`S3_ENDPOINT`** dans le service `api`, et remplacer **`S3_ACCESS_KEY`** et **`S3_SECRET_KEY`** par les clés d'accès d'un utilisateur IAM AWS autorisé sur le bucket S3.
+
+
+**Q4. L'API attend la base et le stockage au démarrage (fonction `initialiser`). Pourquoi est-ce nécessaire même avec `depends_on` ?**
+
+> **Réponse :**
+> * Dans `docker-compose.yml`, le service `minio` est déclaré avec `condition: service_started` (et non `service_healthy`) : Docker démarre donc le conteneur `api` dès que le processus MinIO est lancé, avant même que son serveur S3 interne n'ait ouvert son port 9000 et soit prêt à répondre aux requêtes HTTP.
+> * De plus, dans une architecture distribuée ou cloud (où la base et S3 sont des services externes sur le réseau), la fonction `initialiser()` apporte de la résilience : elle permet à l'API de patienter et de réessayer proprement en cas de latence réseau au démarrage, plutôt que de planter immédiatement.
+
+---
+
+## Partie 4 : Sortir les secrets et nettoyer (5 min)
+
+### 1. Création du fichier `.env`, exclusion dans `.gitignore` et vérification de la substitution
+
+**Commandes exécutées :**
+```bash
+cat > .env <<'EOF'
+POSTGRES_PASSWORD=app_mdp
+MINIO_ROOT_PASSWORD=tp3-secret-123
+EOF
+chmod 600 .env
+echo ".env" >> .gitignore
+
+sed -i 's/app_mdp/${POSTGRES_PASSWORD}/g' docker-compose.yml
+sed -i 's/tp3-secret-123/${MINIO_ROOT_PASSWORD}/g' docker-compose.yml
+
+grep -n 'PASSWORD\|SECRET\|DATABASE_URL' docker-compose.yml
+docker compose config | grep -n 'PASSWORD\|SECRET'
+```
+
+**Sorties observées :**
+```text
+etudiant@ubuntu-ser:~/tp3$ grep -n 'PASSWORD\|SECRET\|DATABASE_URL' docker-compose.yml
+7:      DATABASE_URL: postgresql://app:${POSTGRES_PASSWORD}@db:5432/app
+10:      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+22:      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+38:      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+
+etudiant@ubuntu-ser:~/tp3$ docker compose config | grep -n 'PASSWORD\|SECRET'
+20:      S3_SECRET_KEY: tp3-secret-123
+31:      POSTGRES_PASSWORD: app_mdp
+55:      MINIO_ROOT_PASSWORD: tp3-secret-123
+```
+
+---
+
+### 2. Redémarrage de validation et arrêt propre (conservation des volumes)
+
+**Commandes exécutées :**
+```bash
+docker compose up -d && curl -s http://localhost:5000/sante
+docker compose down
+docker volume ls | grep tp3
+```
+
+**Sorties observées :**
+```text
+etudiant@ubuntu-ser:~/tp3\$ docker compose up -d && curl -s http://localhost:5000/sante
+[+] Running 3/3
+ ✔ Container tp3-minio-1  Running                                              0.0s
+ ✔ Container tp3-db-1     Healthy                                              1.2s
+ ✔ Container tp3-api-1    Running                                              0.0s
+{"base":"ok","stockage":"ok"}
+
+etudiant@ubuntu-ser:~/tp3\$ docker compose down
+[+] Running 4/4
+ ✔ Container tp3-api-1    Removed                                             12.5s
+ ✔ Container tp3-db-1     Removed                                              2.6s
+ ✔ Container tp3-minio-1  Removed                                              2.8s
+ ✔ Network tp3_default    Removed                                              0.7s
+
+etudiant@ubuntu-ser:~/tp3\$ docker volume ls | grep tp3
+local     tp3_db-data
+local     tp3_minio-data
+```
+
+---
+
+### 3. Questions et Réponses
+
+**Q1. Que montre `docker compose config` à la place de `${POSTGRES_PASSWORD}` ? Le secret a-t-il disparu de la machine ou seulement du dépôt Git ?**
+
+> **Réponse :**
+> * **Ce que montre `docker compose config` :** La commande affiche le fichier Compose final résolu par Docker : elle remplace `${POSTGRES_PASSWORD}` par sa valeur réelle en clair (**`app_mdp`**) lue automatiquement dans le fichier `.env`.
+> * **Emplacement du secret :** Le secret **n'a pas disparu de la machine** : il reste stocké en clair dans `.env` sur la VM avec des droits restreints (`600`), et injecté dans les variables d'environnement des conteneurs au démarrage. En revanche, il est **exclu du dépôt Git** grâce au fichier `.gitignore`, ce qui évite de le publier sur GitHub.
+
+
+**Q2. Citez deux solutions plus sûres qu'un fichier `.env` pour gérer des secrets dans le cloud (cours de la séance 8 à venir : pensez aux services managés).**
+
+> **Réponse :**
+> Les deux solutions plus sûres qu'un fichier `.env` pour gérer des secrets dans le cloud sont :
+> 1. **AWS Secrets Manager** (ou **Azure Key Vault** / **Google Secret Manager**) : un service cloud managé qui chiffre les secrets au repos et en transit, contrôle finement les droits d'accès via IAM et gère la rotation automatique des mots de passe.
+> 2. **HashiCorp Vault** (ou **AWS Systems Manager Parameter Store**) : un coffre-fort centralisé permettant d'injecter dynamiquement les secrets en mémoire au lancement des conteneurs sans jamais les stocker dans un fichier sur le disque.
