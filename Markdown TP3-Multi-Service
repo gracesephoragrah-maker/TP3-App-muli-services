@@ -10,7 +10,7 @@
 
 ## Partie 0 : Préparer la VM
 
-Ici, on augmente la mémoire RAM de la VM initiale à 3 Go, on ajoute la redirection de port pour la console MinIO, on arrête les conteneurs du TP 2 de Docker et on récupère les images nécessaires (`postgres:17` et `cgr.dev/chainguard/minio:latest`).
+Ici, on augmente la mémoire RAM de la VM initiale à 3 Go, on ajoute les redirections de port pour la console MinIO  et l'API, on arrête les conteneurs du TP 2 et on récupère les images nécessaires (postgres:17 et cgr.dev/chainguard/minio:latest).
 
 ### 1. Commandes exécutées
 
@@ -195,7 +195,7 @@ etudiant@ubuntu-ser:~/tp3$ docker compose exec db psql -U app -d app -c "SELECT 
 >   * `tp3-minio-1` : **`172.18.0.2/16`**
 >   * `tp3-db-1` : **`172.18.0.3/16`**
 >   * `tp3-api-1` : **`172.18.0.4/16`**
-> * Depuis le conteneur `api`, le nom de service `db` se résout vers **`172.18.0.3`** grâce au serveur DNS interne intégré à Docker Compose.
+> * Depuis le conteneur `api`, le nom de service `db` se résout vers **`172.18.0.3`** grâce au serveur DNS interne intégré à Docker Compose.Les services se joignent donc par leur nom, sans connaître leur IP.
 
 
 **Q3. Le port 5432 est-il joignable depuis la VM (`nc`) ? Pourquoi ? Est-ce un bon choix de sécurité ? Faites le lien avec les sous-réseaux privés du cloud.**
@@ -347,7 +347,7 @@ LINE 1: SELECT * FROM test;
 **Q3. Pourquoi ne faut-il jamais lancer `down -v` sur un serveur de production sans sauvegarde ?**
 
 > **Réponse :**
-> L'option `-v` ordonne à Docker de détruire définitivement tous les volumes nommés associés à l'application en même temps que les conteneurs. Sur un serveur de production, exécuter `docker compose down -v` sans sauvegarde préalable entraînerait l'**effacement irréversible de toutes les données persistantes** (bases de données, fichiers téléversés par les utilisateurs, etc.).
+> Réponse : L'option -v ordonne à Docker de détruire définitivement tous les volumes nommés associés à l'application en même temps que les conteneurs. Sur un serveur de production, exécuter docker compose down -v sans sauvegarde préalable entraînerait l'effacement irréversible de toutes les données persistantes : la base de données (tp3_db-data) et les fichiers déposés dans le stockage objet (tp3_minio-data), comme observé lors du test (les deux volumes ont été supprimés et la table test a disparu).
 
 ---
 
